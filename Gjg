@@ -1,0 +1,610 @@
+import logging
+import asyncio
+import os
+import re
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, 
+    filters, CallbackQueryHandler, ConversationHandler, ContextTypes
+)
+from telethon import TelegramClient, functions
+from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
+from telethon.tl.types import CodeSettings
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ==================== КОНФИГУРАЦИЯ ====================
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Токен бота от @BotFather
+ADMIN_PASSWORD = "12345"  # Пароль для доступа к боту
+CRYPTO_WALLET = "0xAbCdEf123456789..."  # Ваш криптокошелек
+PHYSICAL_ACCOUNT_LINK = "https://t.me/mariaazk"  # Ссылка на физ.аккаунт
+API_ID = 12345  # API ID с my.telegram.org
+API_HASH = "your_api_hash_here"  # API Hash с my.telegram.org
+PHOTO_PATH = "worker.jpg"  # Путь к фото
+SESSIONS_DIR = "sessions"  # Папка с сессиями
+
+# ==================== ПРОВЕРКА КОНФИГУРАЦИИ ====================
+def check_config():
+    """Проверяет наличие всех необходимых параметров"""
+    errors = []
+    
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        errors.append("❌ Не указан BOT_TOKEN")
+    
+    if API_ID == 12345:
+        errors.append("❌ Не указан API_ID")
+    
+    if API_HASH == "your_api_hash_here":
+        errors.append("❌ Не указан API_HASH")
+    
+    if errors:
+        print("\n".join(errors))
+        print("\n⚠️ Исправьте ошибки в конфигурации и перезапустите бота!")
+        return False
+    
+    return True
+
+# ==================== РАБОТА С СЕССИЯМИ ====================
+class SessionManager:
+    """Класс для управления сессиями Telethon"""
+    
+    def __init__(self, sessions_dir=SESSIONS_DIR):
+        self.sessions_dir = sessions_dir
+        self.active_sessions = {}  # user_id: client
+        
+        # Создаем папку для сессий
+        os.makedirs(self.sessions_dir, exist_ok=True)
+        
+        logger.info(f"📁 Папка с сессиями: {os.path.abspath(self.sessions_dir)}")
+    
+    def find_session_file(self, user_id):
+        """Находит файл сессии для пользователя"""
+        # Сначала ищем по точному имени (user_id.session)
+        exact_file = os.path.join(self.sessions_dir, f"{user_id}.session")
+        if os.path.exists(exact_file):
+            return exact_file
+        
+        # Если не нашли, ищем любой .session файл в папке
+        session_files = list(Path(self.sessions_dir).glob("*.session"))
+        if session_files:
+            # Берем первый попавшийся
+            return str(session_files[0])
+        
+        return None
+    
+    def validate_session_file(self, session_file):
+        """Проверяет, является ли файл корректной сессией Telethon"""
+        if not os.path.exists(session_file):
+            logger.error(f"❌ Файл не существует: {session_file}")
+            return False
+        
+        # Проверяем размер файла
+        file_size = os.path.getsize(session_file)
+        if file_size < 100:
+            logger.error(f"❌ Файл слишком мал ({file_size} байт): {session_file}")
+            return False
+        
+        # Проверяем, что это SQLite база данных
+        try:
+            conn = sqlite3.connect(session_file)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = cursor.fetchall()
+            conn.close()
+            
+            # Проверяем наличие таблицы sessions
+            table_names = [t[0] for t in tables]
+            if 'sessions' not in table_names:
+                logger.error(f"❌ Файл не содержит таблицу 'sessions': {session_file}")
+                return False
+            
+            logger.info(f"✅ Файл сессии прошел проверку: {session_file}")
+            logger.info(f"   Размер: {file_size} байт")
+            logger.info(f"   Таблицы: {', '.join(table_names)}")
+            
+            return True
+            
+        except sqlite3.DatabaseError as e:
+            logger.error(f"❌ Файл не является SQLite базой: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки файла: {e}")
+            return False
+    
+    async def load_session(self, user_id):
+        """Загружает сессию для пользователя"""
+        # Если сессия уже загружена, возвращаем её
+        if user_id in self.active_sessions:
+            client = self.active_sessions[user_id]
+            if client.is_connected() and await client.is_user_authorized():
+                logger.info(f"✅ Использую уже загруженную сессию для user_id: {user_id}")
+                return client
+            else:
+                # Если клиент не работает, удаляем его
+                del self.active_sessions[user_id]
+        
+        # Ищем файл сессии
+        session_file = self.find_session_file(user_id)
+        
+        if not session_file:
+            logger.warning(f"⚠️ Файл сессии не найден для user_id: {user_id}")
+            return None
+        
+        # Проверяем файл
+        if not self.validate_session_file(session_file):
+            logger.warning(f"⚠️ Файл сессии поврежден, пробуем загрузить принудительно...")
+            # Даже если проверка не прошла, пробуем загрузить
+        
+        # Загружаем сессию
+        try:
+            client = TelegramClient(session_file, API_ID, API_HASH)
+            await client.connect()
+            
+            # Проверяем авторизацию
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                logger.info(f"✅ Сессия успешно загружена для @{me.username} (ID: {me.id})")
+                
+                # Сохраняем в активные сессии
+                self.active_sessions[user_id] = client
+                
+                # Если файл назывался не по user_id, переименовываем
+                expected_name = os.path.join(self.sessions_dir, f"{user_id}.session")
+                if session_file != expected_name and not os.path.exists(expected_name):
+                    try:
+                        os.rename(session_file, expected_name)
+                        logger.info(f"📝 Файл переименован в {expected_name}")
+                    except:
+                        pass
+                
+                return client
+            else:
+                logger.error(f"❌ Сессия не авторизована: {session_file}")
+                await client.disconnect()
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки сессии: {e}")
+            
+            # Если ошибка связана с базой данных, удаляем файл
+            if "file is not a database" in str(e):
+                logger.warning(f"🗑 Удаляем поврежденный файл: {session_file}")
+                try:
+                    os.remove(session_file)
+                except:
+                    pass
+            
+            return None
+    
+    async def close_session(self, user_id):
+        """Закрывает сессию пользователя"""
+        if user_id in self.active_sessions:
+            try:
+                await self.active_sessions[user_id].disconnect()
+            except:
+                pass
+            del self.active_sessions[user_id]
+            logger.info(f"🔒 Сессия закрыта для user_id: {user_id}")
+
+# ==================== СОСТОЯНИЯ ДЛЯ CONVERSATIONHANDLER ====================
+ENTER_PASSWORD, MAILING_MESSAGE, MAILING_USERNAMES = range(3)
+
+# ==================== ИНИЦИАЛИЗАЦИЯ ====================
+session_manager = SessionManager()
+user_data = {}  # Данные пользователей бота
+
+# ==================== КЛАВИАТУРЫ ====================
+def get_main_menu_keyboard():
+    """Клавиатура главного меню"""
+    keyboard = [
+        [InlineKeyboardButton("🔥 | Профиль воркера", callback_data="profile")],
+        [InlineKeyboardButton("💰 | Ворк", callback_data="work"),
+         InlineKeyboardButton("🎁 | Физ.Аккаунт", callback_data="physical")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_button():
+    """Кнопка 'Назад'"""
+    keyboard = [[InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_work_menu_keyboard():
+    """Клавиатура меню 'Ворк'"""
+    keyboard = [
+        [InlineKeyboardButton("🦋 | Рассылка", callback_data="mailing")],
+        [InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    
+    # Инициализируем данные пользователя
+    if user_id not in user_data:
+        user_data[user_id] = {"authenticated": False, "profits": [], "total_cash": 0}
+    
+    # Если пользователь уже аутентифицирован, показываем меню
+    if user_data[user_id]["authenticated"]:
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    
+    # Запрашиваем пароль
+    await update.message.reply_text("🔒 Введите пароль для доступа к боту:")
+    return ENTER_PASSWORD
+
+async def check_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка пароля"""
+    user_id = update.effective_user.id
+    
+    if update.message.text == ADMIN_PASSWORD:
+        user_data[user_id]["authenticated"] = True
+        await update.message.reply_text("✅")
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("❌ Неверный пароль. Попробуйте /start")
+        return ConversationHandler.END
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ главного меню"""
+    query = update.callback_query
+    
+    text = (
+        "<b>🍷 | Бот воркера</b>\n\n"
+        "<blockquote>• Для начала работы , перейдите в нужный раздел:</blockquote>\n\n"
+        "<b>🦅 | Удачного ворка!</b>"
+    )
+    
+    photo = open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH
+    
+    if query:
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=photo,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard()
+        )
+        await query.answer()
+    else:
+        await update.message.reply_photo(
+            photo=photo,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard()
+        )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    if not user_data.get(user_id, {}).get("authenticated", False):
+        await query.message.reply_text("❌ Авторизуйтесь через /start")
+        await query.answer()
+        return
+    
+    # Профиль
+    if query.data == "profile":
+        profits = user_data[user_id]["profits"]
+        total = user_data[user_id]["total_cash"]
+        
+        text = (
+            f"<b>Мой профиль 🔥</b>\n\n"
+            f"<b>Воркер: #moyz3s</b>\n"
+            f"• Криптокошелек: {CRYPTO_WALLET}\n"
+            f"• Кол-во профитов: {len(profits)}\n"
+            f"Общая касса: {total} руб.\n\n"
+            f"🦅"
+        )
+        
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_back_button()
+        )
+        await query.answer()
+    
+    # Меню "Ворк"
+    elif query.data == "work":
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption="<blockquote>💼 | Выберите помощник для ворка:</blockquote>",
+            parse_mode='HTML',
+            reply_markup=get_work_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Физический аккаунт
+    elif query.data == "physical":
+        await query.message.reply_text(f"Переход: {PHYSICAL_ACCOUNT_LINK}")
+        await query.answer()
+    
+    # Назад
+    elif query.data == "back_to_main":
+        await show_main_menu(update, context)
+        await query.answer()
+    
+    # Рассылка
+    elif query.data == "mailing":
+        await query.message.delete()
+        
+        # Пытаемся загрузить сессию
+        client = await session_manager.load_session(user_id)
+        
+        if client:
+            # Сессия есть и работает
+            me = await client.get_me()
+            await query.message.reply_text(
+                f"✅ <b>Сессия загружена!</b>\n\n"
+                f"Аккаунт: @{me.username} (ID: {me.id})\n"
+                f"Файл сессии: {session_manager.find_session_file(user_id)}",
+                parse_mode='HTML'
+            )
+            
+            # Запрашиваем текст рассылки
+            await query.message.reply_text(
+                "📝 <b>Текст рассылки</b>\n\n"
+                "Введите текст сообщения для рассылки:",
+                parse_mode='HTML'
+            )
+            return MAILING_MESSAGE
+        else:
+            # Сессии нет
+            await query.message.reply_text(
+                "❌ <b>Сессия не найдена</b>\n\n"
+                "Поместите файл .session в папку <code>sessions/</code>\n"
+                "Файл должен называться <code>{user_id}.session</code>\n\n"
+                f"Ожидаемый файл: <code>{user_id}.session</code>\n"
+                f"Папка: <code>{os.path.abspath(SESSIONS_DIR)}</code>",
+                parse_mode='HTML'
+            )
+            return ConversationHandler.END
+
+async def mailing_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение текста рассылки"""
+    context.user_data['mailing_text'] = update.message.text
+    
+    await update.message.reply_text(
+        "👥 <b>Получатели</b>\n\n"
+        "Введите юзернеймы через пробел:\n"
+        "Пример: @user1 @user2 @user3\n\n"
+        "Или 'отмена' для выхода:",
+        parse_mode='HTML'
+    )
+    return MAILING_USERNAMES
+
+async def mailing_usernames(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск рассылки"""
+    text = update.message.text.strip()
+    
+    if text.lower() == 'отмена':
+        await update.message.reply_text("❌ Рассылка отменена")
+        return ConversationHandler.END
+    
+    # Парсим юзернеймы
+    usernames = re.findall(r'@(\w+)', text)
+    
+    if not usernames:
+        await update.message.reply_text("❌ Нет юзернеймов. Попробуйте снова:")
+        return MAILING_USERNAMES
+    
+    user_id = update.effective_user.id
+    message_text = context.user_data['mailing_text']
+    
+    # Получаем клиент
+    client = await session_manager.load_session(user_id)
+    
+    if not client:
+        await update.message.reply_text("❌ Сессия не загружена")
+        return ConversationHandler.END
+    
+    # Стартуем рассылку
+    await update.message.reply_text(
+        f"📨 <b>Запуск рассылки</b>\n\n"
+        f"Получателей: {len(usernames)}\n"
+        f"Текст: {message_text[:50]}...",
+        parse_mode='HTML'
+    )
+    
+    # Результаты
+    results = {
+        'success': 0, 'failed': 0, 'blocked': 0,
+        'deactivated': 0, 'flood_wait': 0, 'details': []
+    }
+    
+    status_msg = await update.message.reply_text("🔄 Прогресс: 0%")
+    
+    for i, username in enumerate(usernames):
+        try:
+            # Получаем пользователя
+            try:
+                entity = await client.get_entity(username)
+            except ValueError:
+                results['failed'] += 1
+                results['details'].append(f"❌ @{username} - неверный юзернейм")
+                continue
+            
+            # Отправляем сообщение
+            await client.send_message(entity, message_text)
+            
+            results['success'] += 1
+            results['details'].append(f"✅ @{username} - успешно")
+            
+        except FloodWaitError as e:
+            wait = e.seconds
+            results['flood_wait'] += 1
+            results['details'].append(f"⚠️ @{username} - флуд, ожидание {wait}с")
+            
+            if i % 5 == 0:
+                await update.message.reply_text(f"⏱ Флуд-контроль: ждем {wait}с")
+            
+            await asyncio.sleep(wait)
+            
+        except Exception as e:
+            error = str(e)
+            if "USER_IS_BLOCKED" in error:
+                results['blocked'] += 1
+                results['details'].append(f"❌ @{username} - заблокировал")
+            elif "USER_IS_DEACTIVATED" in error:
+                results['deactivated'] += 1
+                results['details'].append(f"❌ @{username} - удален")
+            else:
+                results['failed'] += 1
+                results['details'].append(f"❌ @{username} - {error[:50]}")
+        
+        # Обновляем прогресс
+        if (i + 1) % 5 == 0 or i == len(usernames) - 1:
+            progress = int((i + 1) / len(usernames) * 100)
+            await status_msg.edit_text(f"🔄 Прогресс: {progress}%")
+    
+    # Отчет
+    report = (
+        f"📊 <b>Отчет о рассылке</b>\n\n"
+        f"✅ Успешно: {results['success']}\n"
+        f"❌ Неудачно: {results['failed']}\n"
+        f"🚫 Заблокировали: {results['blocked']}\n"
+        f"💀 Удалены: {results['deactivated']}\n"
+        f"⏱ Флуд: {results['flood_wait']}\n\n"
+    )
+    
+    if results['details']:
+        report += "<b>Детали (первые 10):</b>\n"
+        for detail in results['details'][:10]:
+            report += f"{detail}\n"
+        
+        if len(results['details']) > 10:
+            report += f"... и еще {len(results['details']) - 10}"
+    
+    await update.message.reply_text(report, parse_mode='HTML')
+    
+    # Возвращаемся в меню
+    context.user_data.clear()
+    await show_main_menu(update, context)
+    return ConversationHandler.END
+
+async def add_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавление профита"""
+    user_id = update.effective_user.id
+    
+    if not user_data.get(user_id, {}).get("authenticated", False):
+        await update.message.reply_text("❌ Авторизуйтесь")
+        return
+    
+    try:
+        amount = int(context.args[0])
+        user_data[user_id]["profits"].append(amount)
+        user_data[user_id]["total_cash"] += amount
+        await update.message.reply_text(f"✅ Профит {amount} руб. добавлен!")
+    except:
+        await update.message.reply_text("Использование: /profit [сумма]")
+
+async def check_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка сессии"""
+    user_id = update.effective_user.id
+    
+    session_file = session_manager.find_session_file(user_id)
+    
+    if session_file:
+        valid = session_manager.validate_session_file(session_file)
+        
+        text = (
+            f"📁 <b>Информация о сессии</b>\n\n"
+            f"Файл: {session_file}\n"
+            f"Корректен: {'✅' if valid else '❌'}\n"
+            f"Загружена: {'✅' if user_id in session_manager.active_sessions else '❌'}\n"
+            f"Папка: {os.path.abspath(SESSIONS_DIR)}"
+        )
+        
+        if valid and user_id in session_manager.active_sessions:
+            client = session_manager.active_sessions[user_id]
+            me = await client.get_me()
+            text += f"\n\nАккаунт: @{me.username} (ID: {me.id})"
+    else:
+        text = (
+            f"❌ <b>Сессия не найдена</b>\n\n"
+            f"Папка: {os.path.abspath(SESSIONS_DIR)}\n"
+            f"Ожидаемый файл: {user_id}.session"
+        )
+    
+    await update.message.reply_text(text, parse_mode='HTML')
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена"""
+    await update.message.reply_text("❌ Отменено")
+    return ConversationHandler.END
+
+# ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
+def main():
+    """Запуск бота"""
+    # Проверка конфигурации
+    if not check_config():
+        return
+    
+    print("\n" + "="*50)
+    print("🚀 ЗАПУСК БОТА")
+    print("="*50)
+    print(f"📁 Папка с сессиями: {os.path.abspath(SESSIONS_DIR)}")
+    
+    # Показываем найденные сессии
+    session_files = list(Path(SESSIONS_DIR).glob("*.session"))
+    if session_files:
+        print(f"\n📂 Найденные сессии:")
+        for f in session_files:
+            size = os.path.getsize(f)
+            print(f"   • {f.name} ({size} байт)")
+    else:
+        print(f"\n⚠️ В папке {SESSIONS_DIR} нет .session файлов")
+        print(f"   Положите файл сессии в эту папку")
+    
+    print("\n" + "="*50)
+    
+    # Создаем приложение
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # ConversationHandler для авторизации
+    auth_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={ENTER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)]},
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    # ConversationHandler для рассылки
+    mailing_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^mailing$')],
+        states={
+            MAILING_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, mailing_message)],
+            MAILING_USERNAMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, mailing_usernames)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
+    )
+    
+    # Добавляем обработчики
+    application.add_handler(auth_handler)
+    application.add_handler(mailing_handler)
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CommandHandler("profit", add_profit))
+    application.add_handler(CommandHandler("session", check_session))
+    
+    # Запуск
+    print("✅ Бот запущен и готов к работе!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
